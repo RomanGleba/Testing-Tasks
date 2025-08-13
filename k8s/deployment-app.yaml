@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-nest
+  namespace: app-prod
+  labels:
+    app.kubernetes.io/name: api-nest
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: nestjs-redis
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: api-nest
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: api-nest
+        app.kubernetes.io/component: backend
+        app.kubernetes.io/part-of: nestjs-redis
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "3000"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: nestjs
+          image: ghcr.io/OWNER/REPO:nestjs-${GIT_SHA}   
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: app-config
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-auth
+                  key: REDIS_PASSWORD
+          ports:
+            - name: http
+              containerPort: 3000
+          readinessProbe:
+            httpGet: { path: /redis, port: 3000 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /redis, port: 3000 }
+            initialDelaySeconds: 20
+            periodSeconds: 20
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits:   { cpu: "500m", memory: "512Mi" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
