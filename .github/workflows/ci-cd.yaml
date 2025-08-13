@@ -1,0 +1,87 @@
+name: CI-CD
+on:
+  push:
+    branches: [ main ]  # Запускати workflow тільки при пушах у гілку main
+
+concurrency:
+  group: ci-cd-${{ github.ref }}  # Не дозволяє одночасно запускати кілька workflow для однієї гілки
+  cancel-in-progress: true        # Якщо запущений новий workflow — попередній скасовується
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    outputs:
+      IMAGE_URI: ${{ steps.meta.outputs.image_uri }}  # Передаємо URI образу у наступний job
+    steps:
+      - uses: actions/checkout@v4  # Клонуємо репозиторій
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4  # Налаштовуємо AWS CLI
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}       # AWS ключ із secrets
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }} # AWS секрет
+          aws-region: ${{ secrets.AWS_REGION }}                     # Регіон AWS
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2  # Логін у AWS ECR для пушу образів
+
+      - name: Build & push image
+        run: |
+          IMAGE_TAG=${GITHUB_SHA::7}  # Використовуємо перші 7 символів коміту як тег
+          IMAGE="${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG"
+          docker build -t "$IMAGE" .  # Будуємо образ
+          docker tag "$IMAGE" "${{ steps.login-ecr.outputs.registry }}/$IMAGE" # Тегуємо для ECR
+          docker push "${{ steps.login-ecr.outputs.registry }}/$IMAGE"         # Пушимо в ECR
+
+      - name: Export image URI
+        id: meta
+        run: echo "image_uri=${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+        # Зберігаємо повний URI образу для job deploy
+
+  deploy:
+    needs: build-push  # Запускається тільки після build-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4  # Щоб мати доступ до k8s/manifest-файлів
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4  # AWS CLI для деплою
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.32.0'  # Сумісна версія з EKS кластером
+
+      - name: Update kubeconfig for EKS
+        run: aws eks update-kubeconfig --name "${{ secrets.EKS_CLUSTER }}" --region "${{ secrets.AWS_REGION }}"
+        # Додаємо налаштування доступу до кластера EKS
+
+      - name: Ensure namespace + secrets from .env
+        run: |
+          kubectl apply -f k8s/namespace.yaml || true  # Створюємо namespace, якщо він ще не існує
+          cat <<'EOF' > .env
+          ${{ secrets.ENV_FILE }}  # Створюємо .env файл зі змінних secrets
+          EOF
+          kubectl -n "${{ secrets.K8S_NAMESPACE }}" create secret generic app-secrets \
+            --from-env-file=.env --dry-run=client -o yaml | kubectl apply -f -
+          # Створюємо або оновлюємо secret app-secrets у Kubernetes
+
+      - name: Deploy manifests
+        run: |
+          # Деплой Redis
+          kubectl -n "${{ secrets.K8S_NAMESPACE }}" apply -f k8s/deployment-redis.yaml -f k8s/service-redis.yaml || true
+
+          # Деплой додатку
+          kubectl -n "${{ secrets.K8S_NAMESPACE }}" apply -f k8s/deployment-app.yaml
+          kubectl -n "${{ secrets.K8S_NAMESPACE }}" apply -f k8s/service-app.yaml
+
+          # Оновлення образу у деплойменті на новий з ECR
+          kubectl -n "${{ secrets.K8S_NAMESPACE }}" set image deploy/nestjs-app app="${{ needs.build-push.outputs.IMAGE_URI }}" --record || true
+
+          # Чекаємо завершення оновлення
+          kubectl -n "${{ secrets.K8S_NAMESPACE }}" rollout status deploy/nestjs-app
