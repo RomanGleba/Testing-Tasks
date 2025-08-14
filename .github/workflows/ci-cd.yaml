@@ -34,27 +34,33 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # ВАЖЛИВО: контейнерний драйвер + зробити активним builder
+      # === КРИТИЧНО: створити контейнерний builder і зробити його поточним ===
       - name: Set up Docker Buildx
+        id: buildx
         uses: docker/setup-buildx-action@v3
         with:
           driver: docker-container
-          use: true           # зробити поточним builder
-          install: true       # щоб `docker buildx build` був за замовчуванням
+          use: true                  # робить його "current"
+          install: true
           driver-opts: |
             image=moby/buildkit:latest
             network=host
 
-      - name: Verify builder
-        run: docker buildx ls
+      # Підняти buildkit і показати, що driver=docker-container
+      - name: Bootstrap & verify builder
+        run: |
+          docker buildx inspect "${{ steps.buildx.outputs.name }}" --bootstrap
+          echo "CURRENT BUILDER:"
+          docker buildx ls
 
       - name: Set image tag
         id: vars
         run: echo "TAG=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
 
-      - name: Build & push image
+      - name: Build & push image (GHA cache)
         uses: docker/build-push-action@v6
         with:
+          builder: ${{ steps.buildx.outputs.name }}        # <- Примусово цей builder
           context: .
           push: true
           tags: |
@@ -86,7 +92,7 @@ jobs:
       - name: Install kubectl
         uses: azure/setup-kubectl@v4
         # with:
-        #   version: 'v1.30.0'   # підбери під версію EKS
+        #   version: 'v1.30.0'   # підігнай під версію EKS
 
       - name: Update kubeconfig for EKS
         run: aws eks update-kubeconfig --name "${{ secrets.EKS_CLUSTER }}" --region "${{ secrets.AWS_REGION }}"
@@ -104,7 +110,7 @@ jobs:
         run: |
           kubectl -n "${{ secrets.K8S_NAMESPACE }}" apply -f k8s/deployment-redis.yaml -f k8s/service-redis.yaml
           kubectl -n "${{ secrets.K8S_NAMESPACE }}" apply -f k8s/deployment-app.yaml -f k8s/service-app.yaml
-          # необов'язково:
+          # опційно:
           # kubectl -n "${{ secrets.K8S_NAMESPACE }}" apply -f k8s/ingress.yaml -f k8s/hpa.yaml -f k8s/networkpolicy.yaml
 
       - name: Set new image and rollout
