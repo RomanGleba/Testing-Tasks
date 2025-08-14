@@ -12,7 +12,7 @@ env:
   # Ім'я деплоймента та контейнера в маніфестах (звір із k8s/deployment-app.yaml)
   K8S_DEPLOYMENT: nestjs-app
   K8S_CONTAINER: app
-
+#eee
 jobs:
   build-push:
     runs-on: ubuntu-latest
