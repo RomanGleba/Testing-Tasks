@@ -34,11 +34,19 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+      # ВАЖЛИВО: контейнерний драйвер + зробити активним builder
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
-          install: true
           driver: docker-container
+          use: true           # зробити поточним builder
+          install: true       # щоб `docker buildx build` був за замовчуванням
+          driver-opts: |
+            image=moby/buildkit:latest
+            network=host
+
+      - name: Verify builder
+        run: docker buildx ls
 
       - name: Set image tag
         id: vars
