@@ -34,24 +34,29 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # === КРИТИЧНО: створити контейнерний builder і зробити його поточним ===
+      # === КРИТИЧНО: контейнерний Buildx і зробити його current ===
       - name: Set up Docker Buildx
         id: buildx
         uses: docker/setup-buildx-action@v3
         with:
           driver: docker-container
-          use: true                  # робить його "current"
+          use: true                  # робить цей builder "current"
           install: true
           driver-opts: |
             image=moby/buildkit:latest
             network=host
 
-      # Підняти buildkit і показати, що driver=docker-container
+      # Прибрати default builder (часто має driver=docker)
+      - name: Remove default builder if exists
+        run: docker buildx rm default || true
+
+      # Запустити buildkit і перевірити, що driver=docker-container
       - name: Bootstrap & verify builder
         run: |
           docker buildx inspect "${{ steps.buildx.outputs.name }}" --bootstrap
-          echo "CURRENT BUILDER:"
+          echo "=== BUILDERS ==="
           docker buildx ls
+          echo "=== EXPECTED: current -> docker-container (running) ==="
 
       - name: Set image tag
         id: vars
@@ -60,7 +65,7 @@ jobs:
       - name: Build & push image (GHA cache)
         uses: docker/build-push-action@v6
         with:
-          builder: ${{ steps.buildx.outputs.name }}        # <- Примусово цей builder
+          builder: ${{ steps.buildx.outputs.name }}   # ← критично: використовуємо саме цей builder
           context: .
           push: true
           tags: |
@@ -68,6 +73,9 @@ jobs:
             ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # Якщо хочеш без кешу, коментуй дві лінії вище
+          # або тимчасово:
+          # cache-to: type=inline
 
       - name: Export image URI
         id: meta
@@ -91,8 +99,8 @@ jobs:
 
       - name: Install kubectl
         uses: azure/setup-kubectl@v4
-        # with:
-        #   version: 'v1.30.0'   # підігнай під версію EKS
+        with:
+          version: 'v1.30.0'   # підігнай під версію control plane EKS
 
       - name: Update kubeconfig for EKS
         run: aws eks update-kubeconfig --name "${{ secrets.EKS_CLUSTER }}" --region "${{ secrets.AWS_REGION }}"
@@ -117,3 +125,13 @@ jobs:
         run: |
           kubectl -n "${{ secrets.K8S_NAMESPACE }}" set image deployment/${{ env.K8S_DEPLOYMENT }} ${{ env.K8S_CONTAINER }}="${{ needs.build-push.outputs.IMAGE_URI }}"
           kubectl -n "${{ secrets.K8S_NAMESPACE }}" rollout status deployment/${{ env.K8S_DEPLOYMENT }} --timeout=180s
+
+      # Дебаг після деплою (корисно на налаштуванні)
+      - name: Debug resources
+        if: always()
+        run: |
+          kubectl -n "${{ secrets.K8S_NAMESPACE }}" get pods -o wide
+          kubectl -n "${{ secrets.K8S_NAMESPACE }}" describe deploy/${{ env.K8S_DEPLOYMENT }} || true
+          kubectl -n "${{ secrets.K8S_NAMESPACE }}" logs deploy/${{ env.K8S_DEPLOYMENT }} --tail=120 || true
+          kubectl -n "${{ secrets.K8S_NAMESPACE }}" get svc
+          kubectl -n "${{ secrets.K8S_NAMESPACE }}" get events --sort-by=.lastTimestamp | tail -n 80 || true
