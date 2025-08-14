@@ -1,3 +1,17 @@
+name: CI-CD
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  K8S_DEPLOYMENT: nestjs-app
+  K8S_CONTAINER: app
+
 jobs:
   build-push:
     runs-on: ubuntu-latest
@@ -20,47 +34,88 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # 1) СТВОРИТИ контейнерний builder і зробити його current
+      # Створимо і активуємо контейнерний builder (на майбутнє, але кеш зараз вимкнений)
       - name: Set up Docker Buildx
         id: buildx
         uses: docker/setup-buildx-action@v3
         with:
           driver: docker-container
-          use: true              # <- критично: зробити current
+          use: true
           install: true
           driver-opts: |
             image=moby/buildkit:latest
             network=host
 
-      # 2) Прибрати дефолтний builder (він зазвичай docker-driver)
-      - name: Remove default builder if exists
-        run: docker buildx rm default || true
-
-      # 3) Запустити buildkit і перевірити драйвер
-      - name: Bootstrap & verify builder
-        run: |
-          docker buildx inspect "${{ steps.buildx.outputs.name }}" --bootstrap
-          echo "=== BUILDERS ==="
-          docker buildx ls
-          echo "=== EXPECTED: current -> docker-container (running) ==="
-
       - name: Set image tag
         id: vars
         run: echo "TAG=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
 
-      # 4) ЯВНО сказати build-push використовувати наш builder
-      - name: Build & push image (GHA cache)
+      - name: Build & push image
         uses: docker/build-push-action@v6
         with:
-          builder: ${{ steps.buildx.outputs.name }}   # <- без цього знову піде через docker-driver
+          builder: ${{ steps.buildx.outputs.name }}
           context: .
           push: true
           tags: |
             ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ steps.vars.outputs.TAG }}
             ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # УВАГА: кеш вимкнено спеціально, щоб збірка пройшла
+          # cache-from: type=gha
+          # cache-to: type=gha,mode=max
 
       - name: Export image URI
         id: meta
         run: echo "image_uri=${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ steps.vars.outputs.TAG }}" >> $GITHUB_OUTPUT
+
+  deploy:
+    needs: build-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (static keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Who am I
+        run: aws sts get-caller-identity
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.30.0'
+
+      - name: Update kubeconfig for EKS
+        run: aws eks update-kubeconfig --name "${{ secrets.EKS_CLUSTER }}" --region "${{ secrets.AWS_REGION }}"
+
+      - name: Ensure namespace + app secrets from ENV_FILE
+        run: |
+          kubectl apply -f k8s/namespace.yaml || true
+          cat > .env <<'EOF'
+          ${{ secrets.ENV_FILE }}
+          EOF
+          kubectl -n "${{ secrets.K8S_NAMESPACE }}" create secret generic app-secrets \
+            --from-env-file=.env --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Apply manifests
+        run: |
+          kubectl -n "${{ secrets.K8S_NAMESPACE }}" apply -f k8s/deployment-redis.yaml -f k8s/service-redis.yaml
+          kubectl -n "${{ secrets.K8S_NAMESPACE }}" apply -f k8s/deployment-app.yaml -f k8s/service-app.yaml
+          # опційно:
+          # kubectl -n "${{ secrets.K8S_NAMESPACE }}" apply -f k8s/ingress.yaml -f k8s/hpa.yaml -f k8s/networkpolicy.yaml
+
+      - name: Set new image and rollout
+        run: |
+          kubectl -n "${{ secrets.K8S_NAMESPACE }}" set image deployment/${{ env.K8S_DEPLOYMENT }} ${{ env.K8S_CONTAINER }}="${{ needs.build-push.outputs.IMAGE_URI }}"
+          kubectl -n "${{ secrets.K8S_NAMESPACE }}" rollout status deployment/${{ env.K8S_DEPLOYMENT }} --timeout=180s
+
+      - name: Debug (if needed)
+        if: failure()
+        run: |
+          kubectl -n "${{ secrets.K8S_NAMESPACE }}" get pods -o wide || true
+          kubectl -n "${{ secrets.K8S_NAMESPACE }}" describe deploy/${{ env.K8S_DEPLOYMENT }} || true
+          kubectl -n "${{ secrets.K8S_NAMESPACE }}" logs deploy/${{ env.K8S_DEPLOYMENT }} --tail=200 || true
+          kubectl -n "${{ secrets.K8S_NAMESPACE }}" get events --sort-by=.lastTimestamp | tail -n 80 || true
