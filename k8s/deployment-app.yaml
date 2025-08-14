@@ -1,66 +1,26 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: nestjs-app                     # Ім'я Deployment (має збігатися з тим, що у CI в команді set image)
-  namespace: app                       # Namespace, де буде запущений застосунок (K8S_NAMESPACE у Secrets)
-  labels:
-    app.kubernetes.io/name: nestjs-app # Стандартизовані лейбли (краще для моніторингу/фільтрації)
-    app.kubernetes.io/component: backend
-    app.kubernetes.io/part-of: nestjs-redis
+  name: nestjs-app
 spec:
-  replicas: 2                           # Кількість реплік (мінімум 2 для високої доступності)
+  replicas: 1
   selector:
     matchLabels:
-      app.kubernetes.io/name: nestjs-app # Селектор має збігатися з labels у template
+      app: nestjs-app
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: nestjs-app
-        app.kubernetes.io/component: backend
-        app.kubernetes.io/part-of: nestjs-redis
-      annotations:
-        prometheus.io/scrape: "true"    # Сигнал Prometheus, що контейнер треба моніторити
-        prometheus.io/port: "3000"      # Порт, з якого збирати метрики
-        prometheus.io/path: "/metrics"  # Шлях до метрик (має бути реалізований у NestJS)
+        app: nestjs-app
     spec:
-      securityContext:
-        runAsNonRoot: true              # Забороняє запуск від root
-        runAsUser: 10001                # UID користувача в контейнері
-        runAsGroup: 10001               # GID групи в контейнері
-        fsGroup: 10001                  # Група для доступу до файлової системи
       containers:
-        - name: app                     # Назва контейнера (має збігатися з тим, що у CI)
-          image: public.ecr.aws/docker/library/alpine:3.20 # Тимчасовий образ, CI замінить на ECR
-          imagePullPolicy: IfNotPresent # Тягнути новий образ лише якщо немає локально
+        - name: app                # збігається з K8S_CONTAINER=app у CI
+          image: nginx:alpine      # CI замінить на образ з ECR через `set image`
+          ports:
+            - containerPort: 3000
           envFrom:
             - secretRef:
-                name: app-secrets       # Секрет, створений у CI з ENV_FILE (містить конфіги й паролі)
-          ports:
-            - name: http
-              containerPort: 3000       # Порт, на якому слухає NestJS
-          readinessProbe:               # Перевірка готовності (чи можна надсилати трафік)
-            httpGet:
-              path: /redis              # Якщо залежить від Redis, тут і перевірка
-              port: 3000
-            initialDelaySeconds: 5      # Чекає 5 сек перед першою перевіркою
-            periodSeconds: 10           # Перевірка кожні 10 сек
-            timeoutSeconds: 2           # Таймаут відповіді 2 сек
-            failureThreshold: 3         # 3 невдачі = контейнер вважається "не готовим"
-          livenessProbe:                # Перевірка "живості" (чи не завис контейнер)
-            httpGet:
-              path: /health              # Бажано окремий ендпоінт без залежностей
-              port: 3000
-            initialDelaySeconds: 15
-            periodSeconds: 20
-            timeoutSeconds: 2
-            failureThreshold: 3
-          resources:                     # Ліміти та запити ресурсів
-            requests:
-              cpu: "100m"
-              memory: "128Mi"
-            limits:
-              cpu: "500m"
-              memory: "512Mi"
-          securityContext:
-            allowPrivilegeEscalation: false # Забороняє підвищення привілеїв
-            readOnlyRootFilesystem: true    # Робить root-файлову систему контейнера read-only
+                name: app-secrets
+          # бажано, щоб REDIS_HOST був = "redis" (ім'я сервісу)
+          env:
+            - name: REDIS_HOST
+              value: redis
