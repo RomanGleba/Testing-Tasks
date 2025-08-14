@@ -9,10 +9,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Ім'я деплоймента та контейнера в маніфестах (звір із k8s/deployment-app.yaml)
-  K8S_DEPLOYMENT: nestjs-app
-  K8S_CONTAINER: app
-#eee
+  K8S_DEPLOYMENT: nestjs-app   # звір із k8s/deployment-app.yaml -> metadata.name
+  K8S_CONTAINER: app           # звір із containers[].name
+
 jobs:
   build-push:
     runs-on: ubuntu-latest
@@ -28,9 +27,18 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
+      - name: Who am I
+        run: aws sts get-caller-identity
+
       - name: Login to ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          install: true
+          driver: docker-container
 
       - name: Set image tag
         id: vars
@@ -60,15 +68,17 @@ jobs:
       - name: Configure AWS credentials (static keys)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
+      - name: Who am I
+        run: aws sts get-caller-identity
+
       - name: Install kubectl
         uses: azure/setup-kubectl@v4
-        # Можна зафіксувати версію під EKS (наприклад v1.30.0):
         # with:
-        #   version: 'v1.30.0'
+        #   version: 'v1.30.0'   # підбери під версію EKS
 
       - name: Update kubeconfig for EKS
         run: aws eks update-kubeconfig --name "${{ secrets.EKS_CLUSTER }}" --region "${{ secrets.AWS_REGION }}"
@@ -76,7 +86,6 @@ jobs:
       - name: Ensure namespace + app secrets from ENV_FILE
         run: |
           kubectl apply -f k8s/namespace.yaml || true
-          # Згенерувати секрет app-secrets із мультилайн secret ENV_FILE
           cat > .env <<'EOF'
           ${{ secrets.ENV_FILE }}
           EOF
@@ -85,14 +94,12 @@ jobs:
 
       - name: Apply manifests
         run: |
-          # Redis
           kubectl -n "${{ secrets.K8S_NAMESPACE }}" apply -f k8s/deployment-redis.yaml -f k8s/service-redis.yaml
-          # App (Deployment + Service)
           kubectl -n "${{ secrets.K8S_NAMESPACE }}" apply -f k8s/deployment-app.yaml -f k8s/service-app.yaml
-          # (опційно) Ingress/HPA/NetworkPolicy:
+          # необов'язково:
           # kubectl -n "${{ secrets.K8S_NAMESPACE }}" apply -f k8s/ingress.yaml -f k8s/hpa.yaml -f k8s/networkpolicy.yaml
 
       - name: Set new image and rollout
         run: |
-          kubectl -n "${{ secrets.K8S_NAMESPACE }}" set image deployment/${{ env.K8S_DEPLOYMENT }} ${{ env.K8S_CONTAINER }}="${{ needs.build-push.outputs.IMAGE_URI }}" --record
+          kubectl -n "${{ secrets.K8S_NAMESPACE }}" set image deployment/${{ env.K8S_DEPLOYMENT }} ${{ env.K8S_CONTAINER }}="${{ needs.build-push.outputs.IMAGE_URI }}"
           kubectl -n "${{ secrets.K8S_NAMESPACE }}" rollout status deployment/${{ env.K8S_DEPLOYMENT }} --timeout=180s
